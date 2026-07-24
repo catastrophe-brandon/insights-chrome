@@ -1,0 +1,230 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: chrome-platform-infra-tests
+  annotations:
+    description: |
+      Platform infrastructure tests for insights-chrome.
+      Runs configurable test commands on a recurring basis via Konflux CronJob.
+spec:
+  description: |
+    Platform infrastructure tests for insights-chrome.
+    This pipeline supports multiple test types through configuration.
+  params:
+    - name: SNAPSHOT
+      description: "The Konflux snapshot being tested"
+      type: string
+    - name: git-url
+      description: "The git URL to clone"
+      type: string
+      default: "https://github.com/RedHatInsights/insights-chrome"
+    - name: git-revision
+      description: "The git revision to checkout"
+      type: string
+      default: "main"
+    - name: TEST_COMMANDS
+      description: "Comma-separated list of test commands to run"
+      type: string
+      default: "playwright"
+  results:
+    - name: TEST_OUTPUT
+      description: "Test result summary"
+      value: $(tasks.run-platform-tests.results.TEST_OUTPUT)
+    - name: TEST_RESULT
+      description: "Overall test result (success/failure)"
+      value: $(tasks.run-platform-tests.results.TEST_RESULT)
+  workspaces:
+    - name: source
+      description: "Workspace for source code"
+  tasks:
+    - name: clone-repository
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: https://github.com/konflux-ci/build-definitions
+          - name: revision
+            value: main
+          - name: pathInRepo
+            value: task/git-clone/0.1/git-clone.yaml
+      workspaces:
+        - name: output
+          workspace: source
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+
+    - name: run-platform-tests
+      runAfter:
+        - clone-repository
+      workspaces:
+        - name: source
+          workspace: source
+      params:
+        - name: TEST_COMMANDS
+          value: $(params.TEST_COMMANDS)
+      taskSpec:
+        params:
+          - name: TEST_COMMANDS
+            type: string
+        workspaces:
+          - name: source
+        results:
+          - name: TEST_OUTPUT
+            description: "Test output summary"
+          - name: TEST_RESULT
+            description: "Overall test result"
+        steps:
+          - name: install-dependencies
+            image: registry.access.redhat.com/ubi9/nodejs-20:latest
+            workingDir: $(workspaces.source.path)
+            script: |
+              #!/bin/bash
+              set -euo pipefail
+
+              echo "========================================="
+              echo "Installing dependencies..."
+              echo "========================================="
+              npm ci
+
+          - name: install-playwright-browsers
+            image: registry.access.redhat.com/ubi9/nodejs-20:latest
+            workingDir: $(workspaces.source.path)
+            script: |
+              #!/bin/bash
+              set -euo pipefail
+
+              # Check if playwright is in the test commands
+              if echo "$(params.TEST_COMMANDS)" | grep -q "playwright"; then
+                echo "========================================="
+                echo "Installing Playwright browsers..."
+                echo "========================================="
+                npx playwright install --with-deps chromium
+              else
+                echo "Playwright not in test commands, skipping browser installation"
+              fi
+
+          - name: run-tests
+            image: registry.access.redhat.com/ubi9/nodejs-20:latest
+            workingDir: $(workspaces.source.path)
+            script: |
+              #!/bin/bash
+              set -euo pipefail
+
+              TEST_COMMANDS="$(params.TEST_COMMANDS)"
+              OVERALL_RESULT="success"
+              OUTPUT_FILE="/tmp/test-output.txt"
+
+              echo "=========================================" | tee -a "$OUTPUT_FILE"
+              echo "Platform Infrastructure Tests" | tee -a "$OUTPUT_FILE"
+              echo "Test Commands: $TEST_COMMANDS" | tee -a "$OUTPUT_FILE"
+              echo "=========================================" | tee -a "$OUTPUT_FILE"
+              echo "" | tee -a "$OUTPUT_FILE"
+
+              # Split comma-separated commands and run each
+              IFS=',' read -ra COMMANDS <<< "$TEST_COMMANDS"
+              for cmd in "${COMMANDS[@]}"; do
+                # Trim whitespace
+                cmd=$(echo "$cmd" | xargs)
+
+                echo "----------------------------------------" | tee -a "$OUTPUT_FILE"
+                echo "Running: $cmd" | tee -a "$OUTPUT_FILE"
+                echo "----------------------------------------" | tee -a "$OUTPUT_FILE"
+
+                case "$cmd" in
+                  playwright)
+                    echo "Executing Playwright tests..." | tee -a "$OUTPUT_FILE"
+                    if npm run playwright; then
+                      echo "✓ Playwright tests passed" | tee -a "$OUTPUT_FILE"
+                    else
+                      echo "✗ Playwright tests failed" | tee -a "$OUTPUT_FILE"
+                      OVERALL_RESULT="failure"
+                    fi
+                    ;;
+                  cypress)
+                    echo "Executing Cypress tests..." | tee -a "$OUTPUT_FILE"
+                    if npm run cypress:run; then
+                      echo "✓ Cypress tests passed" | tee -a "$OUTPUT_FILE"
+                    else
+                      echo "✗ Cypress tests failed" | tee -a "$OUTPUT_FILE"
+                      OVERALL_RESULT="failure"
+                    fi
+                    ;;
+                  jest|unit)
+                    echo "Executing Jest unit tests..." | tee -a "$OUTPUT_FILE"
+                    if npm run test; then
+                      echo "✓ Jest tests passed" | tee -a "$OUTPUT_FILE"
+                    else
+                      echo "✗ Jest tests failed" | tee -a "$OUTPUT_FILE"
+                      OVERALL_RESULT="failure"
+                    fi
+                    ;;
+                  custom:*)
+                    # Custom command format: custom:npm run my-test
+                    CUSTOM_CMD="${cmd#custom:}"
+                    echo "Executing custom command: $CUSTOM_CMD" | tee -a "$OUTPUT_FILE"
+                    if eval "$CUSTOM_CMD"; then
+                      echo "✓ Custom command succeeded" | tee -a "$OUTPUT_FILE"
+                    else
+                      echo "✗ Custom command failed" | tee -a "$OUTPUT_FILE"
+                      OVERALL_RESULT="failure"
+                    fi
+                    ;;
+                  *)
+                    echo "⚠ Unknown command: $cmd (skipping)" | tee -a "$OUTPUT_FILE"
+                    ;;
+                esac
+
+                echo "" | tee -a "$OUTPUT_FILE"
+              done
+
+              echo "=========================================" | tee -a "$OUTPUT_FILE"
+              echo "Overall Result: $OVERALL_RESULT" | tee -a "$OUTPUT_FILE"
+              echo "=========================================" | tee -a "$OUTPUT_FILE"
+
+              # Save results
+              cat "$OUTPUT_FILE" | tee $(results.TEST_OUTPUT.path)
+              echo "$OVERALL_RESULT" > $(results.TEST_RESULT.path)
+
+              # Exit with error if any tests failed
+              if [ "$OVERALL_RESULT" = "failure" ]; then
+                exit 1
+              fi
+
+    - name: report-results
+      runAfter:
+        - run-platform-tests
+      taskSpec:
+        params:
+          - name: SNAPSHOT
+            type: string
+          - name: TEST_OUTPUT
+            type: string
+          - name: TEST_RESULT
+            type: string
+        steps:
+          - name: report
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+            script: |
+              #!/bin/bash
+              set -euo pipefail
+
+              echo "========================================="
+              echo "Platform Infrastructure Test Report"
+              echo "========================================="
+              echo "Snapshot: $(params.SNAPSHOT)"
+              echo "Result: $(params.TEST_RESULT)"
+              echo ""
+              echo "Output:"
+              echo "$(params.TEST_OUTPUT)"
+              echo "========================================="
+      params:
+        - name: SNAPSHOT
+          value: $(params.SNAPSHOT)
+        - name: TEST_OUTPUT
+          value: $(tasks.run-platform-tests.results.TEST_OUTPUT)
+        - name: TEST_RESULT
+          value: $(tasks.run-platform-tests.results.TEST_RESULT)
